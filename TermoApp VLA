@@ -1,0 +1,675 @@
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import least_squares
+
+# Importaciones de PyQt6
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QTabWidget, QLabel, QComboBox, 
+                             QPushButton, QTextEdit, QRadioButton, QButtonGroup, 
+                             QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, 
+                             QGroupBox, QFrame)
+from PyQt6.QtCore import Qt
+# --- MODIFICACIÓN 1: AGREGAR QIcon A LOS IMPORTS ---
+from PyQt6.QtGui import QFont, QIcon
+# ---------------------------------------------------
+
+# Importaciones de Matplotlib para Qt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
+
+# =============================================================================
+# MOTOR UNIFAC (Lógica Matemática Intacta)
+# =============================================================================
+class UnifacEngine:
+    def __init__(self):
+        self.groups = {
+            "CH3":   {"R": 0.9011, "Q": 0.848, "Main": 1},
+            "CH2":   {"R": 0.6744, "Q": 0.540, "Main": 1},
+            "ACH":   {"R": 0.5313, "Q": 0.400, "Main": 3},
+            "AC":    {"R": 0.3652, "Q": 0.120, "Main": 3}
+        }
+        self.interactions = {
+            1: {1: 0.0, 3: 61.13},
+            3: {1: -11.12, 3: 0.0}
+        }
+        self.nu1 = {"CH3": 2, "CH2": 5, "ACH": 0, "AC": 0}
+        self.nu2 = {"CH3": 1, "CH2": 0, "ACH": 5, "AC": 1}
+
+        self.r1, self.q1 = self._calc_mol_params(self.nu1)
+        self.r2, self.q2 = self._calc_mol_params(self.nu2)
+
+    def _calc_mol_params(self, nu):
+        r = sum(nu[g] * self.groups[g]["R"] for g in nu)
+        q = sum(nu[g] * self.groups[g]["Q"] for g in nu)
+        return r, q
+
+    def solve(self, T, x1_in):
+        x1 = np.clip(x1_in, 1e-9, 1.0 - 1e-9)
+        x2 = 1.0 - x1
+        z = 10.0
+
+        r_mix = x1*self.r1 + x2*self.r2
+        q_mix = x1*self.q1 + x2*self.q2
+        Phi1 = (x1*self.r1)/r_mix
+        Phi2 = (x2*self.r2)/r_mix
+        Theta1 = (x1*self.q1)/q_mix
+        Theta2 = (x2*self.q2)/q_mix
+        l1 = (z/2)*(self.r1-self.q1)-(self.r1-1)
+        l2 = (z/2)*(self.r2-self.q2)-(self.r2-1)
+
+        lng1_C = np.log(Phi1/x1) + (z/2)*self.q1*np.log(Theta1/Phi1) + l1 - (Phi1/x1)*(x1*l1+x2*l2)
+        lng2_C = np.log(Phi2/x2) + (z/2)*self.q2*np.log(Theta2/Phi2) + l2 - (Phi2/x2)*(x1*l1+x2*l2)
+
+        grupos = list(self.groups.keys())
+
+        def calc_group_activity(x_fracs):
+            xc1, xc2 = x_fracs
+            X_num = {k: xc1*self.nu1[k] + xc2*self.nu2[k] for k in grupos}
+            X_tot = sum(X_num.values())
+            if X_tot == 0: return {k: 0.0 for k in grupos}
+
+            X_m = {k: v/X_tot for k, v in X_num.items()}
+            Theta_denom = sum(X_m[k] * self.groups[k]["Q"] for k in grupos)
+            Theta_m = {k: (X_m[k] * self.groups[k]["Q"]) / Theta_denom for k in grupos}
+            Psi = {m: {n: np.exp(-self.interactions[self.groups[m]["Main"]][self.groups[n]["Main"]] / T) for n in grupos} for m in grupos}
+
+            ln_Gk = {}
+            for k in grupos:
+                sum1 = sum(Theta_m[m] * Psi[m][k] for m in grupos)
+                sum2 = sum((Theta_m[m] * Psi[k][m]) / sum(Theta_m[n] * Psi[n][m] for n in grupos) for m in grupos)
+                ln_Gk[k] = self.groups[k]["Q"] * (1 - np.log(sum1) - sum2)
+            return ln_Gk
+
+        lngk_mix = calc_group_activity((x1, x2))
+        lngk_pure1 = calc_group_activity((1.0, 0.0))
+        lngk_pure2 = calc_group_activity((0.0, 1.0))
+
+        lng1_R = sum(self.nu1[k]*(lngk_mix[k] - lngk_pure1[k]) for k in grupos)
+        lng2_R = sum(self.nu2[k]*(lngk_mix[k] - lngk_pure2[k]) for k in grupos)
+
+        return lng1_C + lng1_R, lng2_C + lng2_R
+
+# =============================================================================
+# APLICACIÓN PRINCIPAL (PyQt6)
+# =============================================================================
+class TermoSuiteApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("TermoSuitePro: VLE n-Heptano / Tolueno")
+        self.resize(1450, 950)
+
+        # --- MODIFICACIÓN 2: ESTABLECER EL ÍCONO DE LA VENTANA ---
+        # Asegúrate de que el archivo "logo_kanguro.png" esté en la misma carpeta que este script.
+        # Si usas otro nombre o ruta, cámbialo aquí.
+        self.setWindowIcon(QIcon("logo_kanguro.png"))
+        # ---------------------------------------------------------
+
+        # Inicializar Lógica
+        self.unifac_engine = UnifacEngine()
+        self._cargar_constantes()
+        self._cargar_datasets()
+        self.params_opt = None
+
+        # Configurar UI
+        self._setup_ui()
+
+        # Cargar datos iniciales
+        if self.base_de_datos:
+            nombres = list(self.base_de_datos.keys())
+            self.combo_dataset.addItems(nombres)
+            self.combo_dataset.setCurrentIndex(0)
+            self.cambiar_dataset()
+
+    def _cargar_constantes(self):
+        self.R = 1.9872
+        self.Tc1, self.Vc1, self.Zc1 = 540.20, 428.00, 0.261
+        self.Tc2, self.Vc2, self.Zc2 = 591.75, 316.00, 0.264
+        self.z = 10.0
+        self.r1_u, self.q1_u = 5.1744, 4.396
+        self.r2_u, self.q2_u = 3.9228, 2.968
+        self.ant1 = {'A': 6.90240, 'B': 1268.115, 'C': 216.900}
+        self.ant2 = {'A': 6.95334, 'B': 1343.943, 'C': 219.377}
+
+    def _cargar_datasets(self):
+        self.base_de_datos = {
+            "13.33 kPa": {
+                "P_sys": 100.0,
+                "t": np.array([325.15, 324.05, 322.75, 322.35, 321.15, 320.25, 319.95, 319.15, 318.25, 317.45, 316.75, 315.55, 315.15, 315.05, 314.85]),
+                "x1": np.array([0.000, 0.036, 0.080, 0.098, 0.155, 0.198, 0.215, 0.280, 0.343, 0.420, 0.547, 0.771, 0.879, 0.959, 1.000]),
+                "g1": np.array([None, 1.551, 1.432, 1.357, 1.300, 1.354, 1.300, 1.224, 1.190, 1.150, 1.076, 1.026, 1.014, 0.998, None], dtype=object),
+                "g2": np.array([None, 0.995, 1.008, 1.016, 1.036, 1.015, 1.036, 1.029, 1.083, 1.108, 1.147, 1.230, 1.262, 1.427, None], dtype=object)
+            },
+            "26.66 kPa": {
+                "P_sys": 200.0,
+                "t": np.array([342.65, 341.95, 340.15, 340.05, 338.35, 337.65, 336.75, 336.05, 334.95, 333.85, 333.25, 333.05, 332.95, 332.65, 332.25, 331.85]),
+                "x1": np.array([0.000, 0.014, 0.081, 0.086, 0.169, 0.193, 0.252, 0.317, 0.418, 0.548, 0.641, 0.671, 0.704, 0.809, 0.910, 1.000]),
+                "g1": np.array([None, 1.671, 1.355, 1.459, 1.306, 1.356, 1.228, 1.196, 1.139, 1.069, 1.049, 1.041, 1.036, 1.005, 0.998, None], dtype=object),
+                "g2": np.array([None, 1.004, 1.001, 1.002, 1.015, 1.008, 1.049, 1.041, 1.068, 1.139, 1.153, 1.175, 1.171, 1.249, 1.319, None], dtype=object)
+            },
+            "53.33 kPa": {
+                "P_sys": 400.0,
+                "t": np.array([362.65, 361.65, 361.15, 360.05, 359.05, 358.75, 357.55, 357.25, 356.05, 354.55, 353.05, 352.55, 352.35, 351.85, 351.55, 351.25, 351.05]),
+                "x1": np.array([0.000, 0.024, 0.038, 0.075, 0.119, 0.127, 0.195, 0.210, 0.290, 0.409, 0.570, 0.645, 0.701, 0.771, 0.847, 0.958, 1.000]),
+                "g1": np.array([None, 1.579, 1.446, 1.422, 1.383, 1.389, 1.285, 1.283, 1.187, 1.124, 1.069, 1.040, 1.023, 1.018, 1.011, 0.998, None], dtype=object),
+                "g2": np.array([None, 0.997, 1.003, 1.004, 1.004, 1.002, 1.011, 1.011, 1.038, 1.073, 1.117, 1.151, 1.177, 1.205, 1.229, 1.260, None], dtype=object)
+            }
+        }
+
+    def _setup_ui(self):
+        # Widget Central
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # Contenedor de Pestañas
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
+
+        # --- Crear Pestañas ---
+        self.tab_ctrl = QWidget()
+        self.tab_gibbs = QWidget()
+        self.tab_combo = QWidget()
+        self.tab_pxy = QWidget()
+        self.tab_txy = QWidget()
+        self.tab_yx = QWidget()
+        self.tab_data = QWidget()
+
+        self.tabs.addTab(self.tab_ctrl, "Control & Ajuste")
+        self.tabs.addTab(self.tab_gibbs, "Energía de Gibbs")
+        self.tabs.addTab(self.tab_combo, "Gráfico Unificado")
+        self.tabs.addTab(self.tab_pxy, "Diagrama P-xy")
+        self.tabs.addTab(self.tab_txy, "Diagrama T-xy")
+        self.tabs.addTab(self.tab_yx, "Diagrama y-x")
+        self.tabs.addTab(self.tab_data, "Tabla de Datos")
+
+        # 1. Tab Control
+        ctrl_layout = QHBoxLayout(self.tab_ctrl)
+        
+        # Panel Izquierdo (Controles)
+        left_panel = QFrame()
+        left_panel.setFixedWidth(350)
+        left_layout = QVBoxLayout(left_panel)
+        ctrl_layout.addWidget(left_panel)
+
+        # Titulo Config
+        lbl_title = QLabel("Configuración")
+        lbl_title.setFont(QFont('Arial', 14, QFont.Weight.Bold))
+        left_layout.addWidget(lbl_title)
+
+        # Grupo Modelos
+        gb_model = QGroupBox("Modelo Termodinámico")
+        gb_layout = QVBoxLayout()
+        
+        self.rb_wilson = QRadioButton("Wilson (Ajuste)")
+        self.rb_wilson.setChecked(True)
+        self.rb_uniquac = QRadioButton("UNIQUAC (Ajuste)")
+        self.rb_unifac = QRadioButton("UNIFAC (Predicción)")
+        
+        self.rb_margules1 = QRadioButton("Margules 1P (Simétrico)")
+        self.rb_margules2 = QRadioButton("Margules 2P (Asimétrico)")
+        self.rb_nrtl = QRadioButton("NRTL (3 Parámetros)")
+        self.rb_vanlaar = QRadioButton("Van Laar (2 Parámetros)")
+
+        # Agrupar botones lógicamente (IDs se mantienen igual para la lógica)
+        self.bg_model = QButtonGroup(self)
+        self.bg_model.addButton(self.rb_wilson, 1)
+        self.bg_model.addButton(self.rb_uniquac, 2)
+        self.bg_model.addButton(self.rb_unifac, 3)
+        self.bg_model.addButton(self.rb_margules1, 4) 
+        self.bg_model.addButton(self.rb_margules2, 5) 
+        self.bg_model.addButton(self.rb_nrtl, 6) # ID 6
+        self.bg_model.addButton(self.rb_vanlaar, 7) # ID 7
+
+        # --- ORDENAMIENTO ALFABÉTICO EN LA INTERFAZ ---
+        gb_layout.addWidget(self.rb_margules1) # M
+        gb_layout.addWidget(self.rb_margules2) # M
+        gb_layout.addWidget(self.rb_nrtl)      # N
+        gb_layout.addWidget(self.rb_unifac)    # U
+        gb_layout.addWidget(self.rb_uniquac)   # U
+        gb_layout.addWidget(self.rb_vanlaar)   # V
+        gb_layout.addWidget(self.rb_wilson)    # W
+        
+        gb_model.setLayout(gb_layout)
+        left_layout.addWidget(gb_model)
+
+        # Dataset Selector
+        left_layout.addWidget(QLabel("Presión del Sistema:"))
+        self.combo_dataset = QComboBox()
+        self.combo_dataset.currentIndexChanged.connect(self.cambiar_dataset)
+        left_layout.addWidget(self.combo_dataset)
+
+        # Botón Ejecutar
+        btn_run = QPushButton("▶ EJECUTAR CÁLCULO")
+        btn_run.setStyleSheet("font-weight: bold; padding: 8px;")
+        btn_run.clicked.connect(self.ejecutar)
+        left_layout.addWidget(btn_run)
+
+        # Log Text Area
+        self.txt_log = QTextEdit()
+        self.txt_log.setFont(QFont("Arial", 11)) 
+        self.txt_log.setReadOnly(True)
+        left_layout.addWidget(self.txt_log)
+
+        # Panel Derecho (Plot Principal)
+        self.plot_main_widget, self.fig1, self.ax1 = self._create_plot_widget()
+        ctrl_layout.addWidget(self.plot_main_widget)
+
+        # 2-6. Pestañas de Gráficos (Solo Plot Widgets)
+        self.plot_gibbs_widget, self.fig2, self.ax2 = self._create_plot_widget()
+        self._add_widget_to_tab(self.tab_gibbs, self.plot_gibbs_widget)
+
+        self.plot_combo_widget, self.fig3, self.ax3 = self._create_plot_widget()
+        self._add_widget_to_tab(self.tab_combo, self.plot_combo_widget)
+
+        self.plot_pxy_widget, self.fig4, self.ax4 = self._create_plot_widget()
+        self._add_widget_to_tab(self.tab_pxy, self.plot_pxy_widget)
+
+        self.plot_txy_widget, self.fig5, self.ax5 = self._create_plot_widget()
+        self._add_widget_to_tab(self.tab_txy, self.plot_txy_widget)
+
+        self.plot_yx_widget, self.fig6, self.ax6 = self._create_plot_widget()
+        self._add_widget_to_tab(self.tab_yx, self.plot_yx_widget)
+
+        # 7. Tabla de Datos
+        self._build_data_table(self.tab_data)
+
+    def _add_widget_to_tab(self, tab, widget):
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0,0,0,0)
+        layout.addWidget(widget)
+
+    def _create_plot_widget(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        fig = plt.Figure(figsize=(5, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        canvas = FigureCanvasQTAgg(fig)
+        toolbar = NavigationToolbar(canvas, widget)
+        
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas)
+        
+        return widget, fig, ax
+
+    def _build_data_table(self, tab):
+        layout = QVBoxLayout(tab)
+        
+        cols = ["T", "x1", "x2", "y1_cal", "g1_exp", "g1_cal", "Err_lng1", "g2_exp", "g2_cal", "Err_lng2", "P1s", "P2s"]
+        headers = ["T (K)", "x1 (Liq)", "x2 (Liq)", "y1 (Vap)", "γ1 Exp", "γ1 Calc", "Err |lnγ1|", "γ2 Exp", "γ2 Calc", "Err |lnγ2|", "P1s (mmHg)", "P2s (mmHg)"]
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(cols))
+        self.table.setHorizontalHeaderLabels(headers)
+        
+        # Estilo de tabla
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.table)
+
+    # =========================================================================
+    # LOGICA DE NEGOCIO Y GRAFICOS
+    # =========================================================================
+
+    def cambiar_dataset(self):
+        sel = self.combo_dataset.currentText()
+        if not sel or sel not in self.base_de_datos: return
+
+        data = self.base_de_datos[sel]
+        self.P_sys = data["P_sys"]
+
+        mask = np.array([(data['g1'][i] is not None) and (data['g2'][i] is not None) for i in range(len(data['x1']))])
+        self.x1_cl = np.array(data['x1'][mask], dtype=float)
+        self.T_cl = np.array(data['t'][mask], dtype=float)
+        self.g1_cl = np.array(data['g1'][mask], dtype=float)
+        self.g2_cl = np.array(data['g2'][mask], dtype=float)
+
+        self.ln_g1_exp = np.log(self.g1_cl)
+        self.ln_g2_exp = np.log(self.g2_cl)
+        self.ge_rt_exp = self.x1_cl * self.ln_g1_exp + (1-self.x1_cl) * self.ln_g2_exp
+
+        self.txt_log.clear()
+        self._limpiar_todo()
+
+    def _limpiar_todo(self):
+        self.table.setRowCount(0)
+        for ax in [self.ax1, self.ax2, self.ax3, self.ax4, self.ax5, self.ax6]:
+            ax.clear()
+            ax.grid(True, alpha=0.3)
+        for fig in [self.fig1, self.fig2, self.fig3, self.fig4, self.fig5, self.fig6]:
+            fig.canvas.draw()
+
+    def calc_psat(self, T_K, comp):
+        T_C = T_K - 273.15
+        consts = self.ant1 if comp == 1 else self.ant2
+        return 10**(consts['A'] - consts['B']/(T_C + consts['C']))
+
+    def rackett_volume(self, T, Vc, Zc, Tc):
+        Tr = T / Tc
+        return Vc * (Zc ** ((1.0 - Tr)**(2.0/7.0)))
+
+    def _model_wilson(self, params, x1, T):
+        A12, A21 = params
+        x2 = 1.0 - x1
+        V1 = self.rackett_volume(T, self.Vc1, self.Zc1, self.Tc1)
+        V2 = self.rackett_volume(T, self.Vc2, self.Zc2, self.Tc2)
+        L12 = (V2/V1)*np.exp(-A12/(self.R*T))
+        L21 = (V1/V2)*np.exp(-A21/(self.R*T))
+        S1 = x1 + L12*x2
+        S2 = x2 + L21*x1
+        term = (L12/S1) - (L21/S2)
+        ln1 = -np.log(S1) + x2*term
+        ln2 = -np.log(S2) - x1*term
+        return ln1, ln2
+
+    def _model_uniquac(self, params, x1, T):
+        du12, du21 = params
+        x2 = 1.0 - x1
+        r_mix = x1*self.r1_u + x2*self.r2_u
+        q_mix = x1*self.q1_u + x2*self.q2_u
+        Phi1, Phi2 = (x1*self.r1_u)/r_mix, (x2*self.r2_u)/r_mix
+        Theta1, Theta2 = (x1*self.q1_u)/q_mix, (x2*self.q2_u)/q_mix
+        l1 = (self.z/2)*(self.r1_u - self.q1_u)-(self.r1_u - 1)
+        l2 = (self.z/2)*(self.r2_u - self.q2_u)-(self.r2_u - 1)
+        lng1_C = np.log(Phi1/x1) + (self.z/2)*self.q1_u*np.log(Theta1/Phi1) + l1 - (Phi1/x1)*(x1*l1 + x2*l2)
+        lng2_C = np.log(Phi2/x2) + (self.z/2)*self.q2_u*np.log(Theta2/Phi2) + l2 - (Phi2/x2)*(x1*l1 + x2*l2)
+        tau12 = np.exp(-du12/(self.R*T))
+        tau21 = np.exp(-du21/(self.R*T))
+        S1 = Theta1 + Theta2*tau21
+        S2 = Theta2 + Theta1*tau12
+        lng1_R = self.q1_u*(1 - np.log(S1) - (Theta1/S1 + Theta2*tau12/S2))
+        lng2_R = self.q2_u*(1 - np.log(S2) - (Theta2/S2 + Theta1*tau21/S1))
+        return lng1_C + lng1_R, lng2_C + lng2_R
+
+    def wrapper_modelo(self, params, x1, T):
+        x1_arr = np.array(x1, dtype=float) if np.isscalar(x1) or isinstance(x1, list) else x1
+        T_arr = np.array(T, dtype=float) if np.isscalar(T) or isinstance(T, list) else T
+        if x1_arr.shape != T_arr.shape: T_arr = np.full_like(x1_arr, T)
+
+        mod_id = self.bg_model.checkedId()
+        
+        if mod_id == 1: # Wilson
+            ln1, ln2 = self._model_wilson(params, x1_arr, T_arr)
+        elif mod_id == 2: # UNIQUAC
+            ln1, ln2 = self._model_uniquac(params, x1_arr, T_arr)
+        elif mod_id == 3: # UNIFAC
+            l1_list, l2_list = [], []
+            if np.isscalar(x1_arr): iter_zip = [(x1_arr, T_arr)]
+            else: iter_zip = zip(x1_arr, T_arr)
+            for vx, vt in iter_zip:
+                l1, l2 = self.unifac_engine.solve(float(vt), float(vx))
+                l1_list.append(l1); l2_list.append(l2)
+            ln1, ln2 = np.array(l1_list), np.array(l2_list)
+        
+        elif mod_id == 4: # Margules 1P
+            A = params[0]
+            x2 = 1.0 - x1_arr
+            ln1 = A * (x2**2)
+            ln2 = A * (x1_arr**2)
+            
+        elif mod_id == 5: # Margules 2P
+            A12, A21 = params
+            x2 = 1.0 - x1_arr
+            ln1 = (x2**2) * (A12 + 2 * (A21 - A12) * x1_arr)
+            ln2 = (x1_arr**2) * (A21 + 2 * (A12 - A21) * x2)
+        
+        # --- NUEVOS MODELOS AGREGADOS ---
+        elif mod_id == 6: # NRTL
+            dg12, dg21, alpha = params
+            x2 = 1.0 - x1_arr
+            
+            tau12 = dg12 / (self.R * T_arr)
+            tau21 = dg21 / (self.R * T_arr)
+            
+            G12 = np.exp(-alpha * tau12)
+            G21 = np.exp(-alpha * tau21)
+            
+            # Denominadores comunes
+            D1 = x2 + x1_arr * G12
+            D2 = x1_arr + x2 * G21
+            
+            # Cálculo de ln gamma
+            term1_1 = tau21 * (G21 / D2)**2
+            term1_2 = (tau12 * G12) / (D1**2)
+            ln1 = (x2**2) * (term1_1 + term1_2)
+            
+            term2_1 = tau12 * (G12 / D1)**2
+            term2_2 = (tau21 * G21) / (D2**2)
+            ln2 = (x1_arr**2) * (term2_1 + term2_2)
+            
+        elif mod_id == 7: # VanLaar
+            A12, A21 = params
+            x2 = 1.0 - x1_arr
+            # Evitar división por cero
+            denom = A12 * x1_arr + A21 * x2
+            denom = np.where(denom == 0, 1e-10, denom) 
+            
+            term1 = (A21 * x2) / denom
+            term2 = (A12 * x1_arr) / denom
+            
+            ln1 = A12 * (term1 ** 2)
+            ln2 = A21 * (term2 ** 2)
+
+        else:
+            return None, None, None
+            
+        ge = x1_arr*ln1 + (1-x1_arr)*ln2
+        return ln1, ln2, ge
+
+    def residuos(self, params):
+        ln1, ln2, _ = self.wrapper_modelo(params, self.x1_cl, self.T_cl)
+        return np.concatenate([ln1 - self.ln_g1_exp, ln2 - self.ln_g2_exp])
+
+    def ejecutar(self):
+        try:
+            mod_id = self.bg_model.checkedId()
+            modelo_str = {
+                1: "Wilson", 
+                2: "UNIQUAC", 
+                3: "UNIFAC",
+                4: "Margules 1P",
+                5: "Margules 2P",
+                6: "NRTL",
+                7: "Van Laar"
+            }[mod_id]
+
+            if mod_id == 3: # UNIFAC (Sin Ajuste)
+                self.params_opt = []
+                g1_str = "[" + ", ".join([f"{k}:{v}" for k,v in self.unifac_engine.nu1.items() if v > 0]) + "]"
+                g2_str = "[" + ", ".join([f"{k}:{v}" for k,v in self.unifac_engine.nu2.items() if v > 0]) + "]"
+
+                msg_opt = (f"UNIFAC PREDICTIVO\n(Sin ajuste)\n\n"
+                           f"Grupos Funcionales:\n"
+                           f"Comp 1: {g1_str}\n"
+                           f"Comp 2: {g2_str}")
+            else:
+                # --- Configuración de Ajuste según Modelo ---
+                if mod_id == 1: # Wilson
+                    x0 = [-50.0, 150.0]
+                elif mod_id == 2: # UNIQUAC
+                    x0 = [200.0, -200.0]
+                elif mod_id == 4: # Margules 1P
+                    x0 = [0.5]
+                elif mod_id == 5: # Margules 2P
+                    x0 = [0.5, 0.5]
+                elif mod_id == 6: # NRTL
+                    x0 = [0.0, 0.0, 0.3] # dg12, dg21, alpha
+                elif mod_id == 7: # Van Laar
+                    x0 = [0.5, 0.5] # A12, A21
+
+                # Ejecutar Minimización
+                res = least_squares(self.residuos, x0, method='trf')
+                self.params_opt = res.x
+
+                # --- Generar Texto de Resultados ---
+                if mod_id == 2: # UNIQUAC
+                    msg_opt = (f"UNIQUAC OPTIMIZADO\n"
+                               f"du12: {res.x[0]:.2f} cal/mol\n"
+                               f"du21: {res.x[1]:.2f} cal/mol\n\n"
+                               f"Parámetros Estructurales:\n"
+                               f"r1: {self.r1_u}  q1: {self.q1_u}\n"
+                               f"r2: {self.r2_u}  q2: {self.q2_u}\n\n"
+                               f"Error Obj: {res.cost:.5f}")
+                elif mod_id == 1: # Wilson
+                    msg_opt = (f"Wilson OPTIMIZADO\n"
+                               f"A12: {res.x[0]:.2f} cal/mol\n"
+                               f"A21: {res.x[1]:.2f} cal/mol\n"
+                               f"Error Obj: {res.cost:.5f}")
+                elif mod_id == 4: # Margules 1P
+                    msg_opt = (f"Margules 1P\n"
+                               f"A: {res.x[0]:.4f}\n"
+                               f"Error Obj: {res.cost:.5f}")
+                elif mod_id == 5: # Margules 2P
+                    msg_opt = (f"Margules 2P\n"
+                               f"A12: {res.x[0]:.4f}\n"
+                               f"A21: {res.x[1]:.4f}\n"
+                               f"Error Obj: {res.cost:.5f}")
+                elif mod_id == 6: # NRTL
+                    msg_opt = (f"NRTL OPTIMIZADO\n"
+                               f"dg12: {res.x[0]:.2f} cal/mol\n"
+                               f"dg21: {res.x[1]:.2f} cal/mol\n"
+                               f"alpha: {res.x[2]:.4f}\n"
+                               f"Error Obj: {res.cost:.5f}")
+                elif mod_id == 7: # Van Laar
+                    msg_opt = (f"Van Laar OPTIMIZADO\n"
+                               f"A12: {res.x[0]:.4f}\n"
+                               f"A21: {res.x[1]:.4f}\n"
+                               f"Error Obj: {res.cost:.5f}")
+
+            ln1_c, ln2_c, ge_c = self.wrapper_modelo(self.params_opt, self.x1_cl, self.T_cl)
+
+            P1s_exp = self.calc_psat(self.T_cl, 1)
+            P2s_exp = self.calc_psat(self.T_cl, 2)
+            y1_calc = (self.x1_cl * np.exp(ln1_c) * P1s_exp) / self.P_sys
+
+            x_smooth = np.linspace(0.001, 0.999, 200)
+            T_mean = np.mean(self.T_cl)
+            ln1_s, ln2_s, ge_s = self.wrapper_modelo(self.params_opt, x_smooth, np.full_like(x_smooth, T_mean))
+            P_burb = x_smooth * np.exp(ln1_s) * self.calc_psat(T_mean, 1) + (1-x_smooth) * np.exp(ln2_s) * self.calc_psat(T_mean, 2)
+            y1_iso = (x_smooth * np.exp(ln1_s) * self.calc_psat(T_mean, 1)) / P_burb
+
+            mae1 = np.mean(np.abs((np.exp(self.ln_g1_exp) - np.exp(ln1_c))/np.exp(self.ln_g1_exp))) * 100
+            mae2 = np.mean(np.abs((np.exp(self.ln_g2_exp) - np.exp(ln2_c))/np.exp(self.ln_g2_exp))) * 100
+
+            final_text = (f"{msg_opt}\n\n"
+                          f"Error Gamma1: {mae1:.2f}%\n"
+                          f"Error Gamma2: {mae2:.2f}%")
+
+            self.txt_log.setText(final_text)
+
+            self._llenar_tabla(ln1_c, ln2_c, y1_calc, P1s_exp, P2s_exp)
+            self._graficar_principales(x_smooth, ln1_s, ln2_s, ge_s, modelo_str)
+            self._graficar_fases(x_smooth, y1_iso, P_burb, T_mean, y1_calc)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error de Cálculo", str(e))
+            import traceback
+            traceback.print_exc()
+
+    def _llenar_tabla(self, ln1, ln2, y1, p1s, p2s):
+        self.table.setRowCount(0)
+        g1, g2 = np.exp(ln1), np.exp(ln2)
+        
+        self.table.setRowCount(len(self.x1_cl))
+        
+        for i in range(len(self.x1_cl)):
+            x2_val = 1 - self.x1_cl[i]
+            # USO DE ABS() para error absoluto
+            err_lng1_val = abs(ln1[i] - self.ln_g1_exp[i])
+            err_lng2_val = abs(ln2[i] - self.ln_g2_exp[i])
+            
+            row_data = [
+                f"{self.T_cl[i]:.1f}", f"{self.x1_cl[i]:.3f}", f"{x2_val:.3f}", f"{y1[i]:.3f}",
+                f"{self.g1_cl[i]:.3f}", f"{g1[i]:.3f}", f"{err_lng1_val:.3f}",
+                f"{self.g2_cl[i]:.3f}", f"{g2[i]:.3f}", f"{err_lng2_val:.3f}",
+                f"{p1s[i]:.0f}", f"{p2s[i]:.0f}"
+            ]
+            
+            for col, val in enumerate(row_data):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(i, col, item)
+
+    def _graficar_principales(self, x, l1, l2, ge, mod):
+        # MODIFICACION: Siempre línea punteada para modelo
+        ls = '--' 
+        
+        # Plot 1
+        self.ax1.clear(); self.ax1.set_title(f"Coeficientes de Actividad ({mod})"); self.ax1.set_xlim(0,1); self.ax1.grid(True)
+        self.ax1.set_xlabel("Fracción Molar $x_1$ (n-Heptano)")
+        self.ax1.set_ylabel("$\ln \gamma$ (Adimensional)")
+        self.ax1.plot(x, l1, 'b'+ls, label='ln $\gamma_1$ (Modelo)'); self.ax1.plot(x, l2, 'r'+ls, label='ln $\gamma_2$ (Modelo)')
+        self.ax1.errorbar(self.x1_cl, self.ln_g1_exp, yerr=0.05, fmt='bo', capsize=3, label='ln $\gamma_1$ (Experimental)')
+        self.ax1.errorbar(self.x1_cl, self.ln_g2_exp, yerr=0.05, fmt='ro', capsize=3, label='ln $\gamma_2$ (Experimental)')
+        self.ax1.legend(); self.fig1.canvas.draw()
+
+        # Plot 2
+        self.ax2.clear(); self.ax2.set_title("Energía de Gibbs de Exceso"); self.ax2.set_xlim(0,1); self.ax2.grid(True)
+        self.ax2.set_xlabel("Fracción Molar $x_1$ (n-Heptano)")
+        self.ax2.set_ylabel("$G^E/RT$ (Adimensional)")
+        self.ax2.plot(x, ge, 'g'+ls, label='Modelo');
+        self.ax2.errorbar(self.x1_cl, self.ge_rt_exp, yerr=0.05, fmt='k^', capsize=3, label='Experimental')
+        self.ax2.legend(); self.fig2.canvas.draw()
+
+        # Plot 3
+        self.ax3.clear(); self.ax3.set_title("Análisis Termodinámico Unificado"); self.ax3.set_xlim(0,1); self.ax3.grid(True)
+        self.ax3.set_xlabel("Fracción Molar $x_1$ (n-Heptano)")
+        self.ax3.set_ylabel("Magnitud Termodinámica")
+        self.ax3.plot(x, l1, 'b'+ls, label='ln $\gamma_1$ (Modelo)'); self.ax3.plot(x, l2, 'r'+ls, label='ln $\gamma_2$ (Modelo)'); self.ax3.plot(x, ge, 'g'+ls, label='$G^E/RT$ (Modelo)')
+        self.ax3.errorbar(self.x1_cl, self.ln_g1_exp, yerr=0.05, fmt='bo', capsize=3, label='ln $\gamma_1$ (Experimental)')
+        self.ax3.errorbar(self.x1_cl, self.ln_g2_exp, yerr=0.05, fmt='ro', capsize=3, label='ln $\gamma_2$ (Experimental)')
+        self.ax3.errorbar(self.x1_cl, self.ge_rt_exp, yerr=0.05, fmt='k^', capsize=3, label='$G^E/RT$ (Experimental)')
+        self.ax3.legend(); self.fig3.canvas.draw()
+
+    def _graficar_fases(self, x, y, P, T, yc):
+        # 4. P-xy
+        self.ax4.clear(); self.ax4.set_title("Diagrama P-xy (Isoterma)"); self.ax4.grid(True)
+        self.ax4.set_xlabel("Fracción Molar Global $z_1$ (n-Heptano)")
+        self.ax4.set_ylabel("Presión Absoluta $P$ (mmHg)")
+        # MODIFICACION: Líneas punteadas (--)
+        self.ax4.plot(x, P, 'b--', label='Líquido (P Burbuja)')
+        self.ax4.plot(y, P, 'r--', label='Vapor (P Rocío)')
+        p_min, p_max = min(P), max(P)
+        self.ax4.text(0.1, p_max*0.99, "Líquido", fontsize=10, color='blue', ha='center')
+        self.ax4.text(0.9, p_min*1.01, "Vapor", fontsize=10, color='red', ha='center')
+        self.ax4.text(0.5, (p_min+p_max)/2, "L+V", fontsize=10, color='purple', ha='center')
+        self.ax4.legend(); self.fig4.canvas.draw()
+
+        # 5. T-xy
+        self.ax5.clear(); self.ax5.set_title("Diagrama T-xy (Isobara Experimental)"); self.ax5.grid(True)
+        self.ax5.set_xlabel("Fracción Molar ($x_1$ Líq / $y_1$ Vapor)")
+        self.ax5.set_ylabel("Temperatura Absoluta $T$ (K)")
+
+        sort_idx = np.argsort(self.x1_cl)
+        x_sorted = self.x1_cl[sort_idx]
+        t_sorted = self.T_cl[sort_idx]
+        y_sorted = yc[sort_idx]
+
+        # MODIFICACION: Líneas punteadas (--) para lo calculado
+        self.ax5.plot(x_sorted, t_sorted, 'b--', alpha=0.4, label='T Burbuja (Modelo/Fit)')
+        self.ax5.errorbar(self.x1_cl, self.T_cl, yerr=0.5, fmt='bo', capsize=3, label='T Burbuja Exp')
+        self.ax5.plot(y_sorted, t_sorted, 'r--', alpha=0.4, label='T Rocío (Calculado)')
+        self.ax5.plot(yc, self.T_cl, 'ro', label='T Rocío Calc')
+        t_min, t_max = min(t_sorted), max(t_sorted)
+        self.ax5.text(0.1, t_min, "Líquido", fontsize=10, color='blue', ha='center')
+        self.ax5.text(0.9, t_max, "Vapor", fontsize=10, color='red', ha='center')
+        self.ax5.text(0.5, (t_min+t_max)/2, "L+V", fontsize=10, color='purple', ha='center')
+        self.ax5.legend(); self.fig5.canvas.draw()
+
+        # 6. y-x
+        self.ax6.clear(); self.ax6.set_title("Diagrama de Equilibrio y-x"); self.ax6.grid(True)
+        self.ax6.set_xlabel("Fracción Molar $x_1$ (n-Heptano) en Líquido")
+        self.ax6.set_ylabel("Fracción Molar $y_1$ (n-Heptano) en Vapor")
+        self.ax6.plot([0,1],[0,1],'k--', label='Referencia x=y')
+        # MODIFICACION: Línea punteada ('g--')
+        self.ax6.plot(x, y, 'g--', label='Curva Modelo (Isoterma)')
+        self.ax6.plot(self.x1_cl, yc, 'go', label='Datos Exp')
+        self.ax6.legend(); self.fig6.canvas.draw()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = TermoSuiteApp()
+    window.show()
+    sys.exit(app.exec())
