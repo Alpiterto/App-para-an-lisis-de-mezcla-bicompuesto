@@ -73,8 +73,11 @@ Una aplicación de escritorio integral diseñada para Ingenieros Químicos para 
 
 *(Add your screenshots here / Agrega tus capturas aquí)*
 
-![App Screenshot](path_to_image.png)
+![App Screenshot](<img width="1355" height="693" alt="image" src="https://github.com/user-attachments/assets/541c15b8-a1af-4682-8deb-68edc60f2ec5" />
+)(<img width="1355" height="693" alt="image" src="https://github.com/user-attachments/assets/f03f0977-1c67-4c30-ae32-74354ab3bb60" />
+)(<img width="1296" height="711" alt="image" src="https://github.com/user-attachments/assets/2ac2706b-0fa8-4448-93a0-c9f98c4222d1" />
+)
 
 ---
 
-**Author / Autor:** [Your Name / Tu Nombre]
+**Author / Autor:** [Angel Torres]
