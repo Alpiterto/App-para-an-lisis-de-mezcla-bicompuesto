@@ -1,1 +1,1 @@
-# App-para-an-lisis-de-mezcla-bicompuesto
+# App-para-análisis-de-mezcla-bicompuesto
